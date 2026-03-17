@@ -102,70 +102,16 @@ function generateUuid() {
   return crypto.randomUUID().replace(/-/g, "");
 }
 
-async function getEdgeTTS(text: string, voice = "en-US-AriaNeural"): Promise<string> {
-  const wsUrl = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-  
-  return new Promise((resolve, reject) => {
-    try {
-      const ws = new WebSocket(wsUrl);
-      const audioChunks: Uint8Array[] = [];
-      const connectionId = generateUuid();
-      
-      ws.onopen = () => {
-        const configMsg = `X-Timestamp:${new Date().toISOString()}\\r\\n` +
-                          `Content-Type:application/json; charset=utf-8\\r\\n` +
-                          `Path:speech.config\\r\\n\\r\\n` +
-                          `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`;
-        ws.send(configMsg);
-
-        const requestId = generateUuid();
-        const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='+0%'>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</prosody></voice></speak>`;
-        
-        const ssmlMsg = `X-RequestId:${requestId}\\r\\n` +
-                        `Content-Type:application/ssml+xml\\r\\n` +
-                        `X-Timestamp:${new Date().toISOString()}Z\\r\\n` +
-                        `Path:ssml\\r\\n\\r\\n` +
-                        ssml;
-        ws.send(ssmlMsg);
-      };
-
-      ws.onmessage = async (event) => {
-        if (typeof event.data === 'string') {
-          if (event.data.includes("Path:turn.end")) {
-            ws.close();
-          }
-        } else if (event.data instanceof Blob) {
-          const buffer = await event.data.arrayBuffer();
-          const view = new DataView(buffer);
-          const headerSize = view.getUint16(0);
-          const audioData = new Uint8Array(buffer, headerSize + 2);
-          audioChunks.push(audioData);
-        }
-      };
-
-      ws.onclose = () => {
-        if (audioChunks.length === 0) {
-          return resolve("");
-        }
-        let totalLen = 0;
-        for (const c of audioChunks) totalLen += c.length;
-        const result = new Uint8Array(totalLen);
-        let offset = 0;
-        for (const c of audioChunks) {
-          result.set(c, offset);
-          offset += c.length;
-        }
-        resolve(encodeBase64(result));
-      };
-
-      ws.onerror = (e) => {
-        resolve(""); // Fallback gracefully if TTS fails
-      };
-    } catch (e) {
-      resolve(""); 
-    }
-  });
+async function logToDb(supabase: any, message: string) {
+  console.error(`DB_LOG: ${message}`);
+  try {
+    await supabase.from('debug_logs').insert({ message: `[${new Date().toISOString()}] ${message}` });
+  } catch (e) {
+    console.error("Failed to log to DB:", e);
+  }
 }
+
+// Removed getEdgeTTS - handled client-side in widget.js
 
 // ═══════════════════════════════════════════════════════════════
 // TIME & DATE UTILITIES
@@ -817,14 +763,11 @@ Deno.serve(async (req: Request) => {
       conversation_id = newConv?.id;
     }
 
-    // GENERATE TTS AUDIO (Edge TTS over WebSocket from Edge Function)
-    const audioBase64 = await getEdgeTTS(response);
-
+    // TTS now handled client-side in widget.js to avoid IP blocks
     return new Response(JSON.stringify({
       response,
       conversation_id,
       step: state.step,
-      audio: audioBase64
     }), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });

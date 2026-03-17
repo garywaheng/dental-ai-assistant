@@ -26,28 +26,92 @@
   let greetingSent = false;
   let typingEl = null;
 
-  // ── TTS ──
-  async function speakBase64Audio(base64Audio) {
-    if (!base64Audio) return;
+  // ── TTS (Edge TTS Implementation) ──
+  function generateUuid() {
+    return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  async function speakText(text, voice = "en-US-AriaNeural") {
+    if (!text) return;
+    const wsUrl = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+    
     return new Promise((resolve) => {
       try {
-        const binaryString = window.atob(base64Audio);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        const blob = new Blob([bytes], { type: "audio/mp3" });
-        const audio = new Audio(URL.createObjectURL(blob));
-        audio.play().catch(e => {
-          console.error("Audio play blocked", e);
-          resolve();
-        });
-        audio.onended = resolve;
-        audio.onerror = resolve;
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = "arraybuffer";
+        const audioChunks = [];
+        let completed = false;
+        
+        const timeout = setTimeout(() => {
+          if (!completed) { ws.close(); resolve(); }
+        }, 10000);
+        
+        ws.onopen = () => {
+          const configMsg = `X-Timestamp:${new Date().toISOString()}\r\n` +
+                            `Content-Type:application/json; charset=utf-8\r\n` +
+                            `Path:speech.config\r\n\r\n` +
+                            `{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}`;
+          ws.send(configMsg);
+
+          const requestId = generateUuid();
+          const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='+0Hz' rate='+0%'>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</prosody></voice></speak>`;
+          
+          const ssmlMsg = `X-RequestId:${requestId}\r\n` +
+                          `Content-Type:application/ssml+xml\r\n` +
+                          `X-Timestamp:${new Date().toISOString()}Z\r\n` +
+                          `Path:ssml\r\n\r\n` +
+                          ssml;
+          ws.send(ssmlMsg);
+        };
+
+        ws.onmessage = async (event) => {
+          if (typeof event.data === 'string') {
+            if (event.data.includes("Path:turn.end")) {
+              ws.close();
+            }
+          } else if (event.data instanceof ArrayBuffer) {
+            const view = new DataView(event.data);
+            const headerSize = view.getUint16(0);
+            const audioData = new Uint8Array(event.data, headerSize + 2);
+            if (audioData.length > 0) {
+              audioChunks.push(audioData);
+            }
+          }
+        };
+
+        ws.onclose = () => {
+          completed = true;
+          clearTimeout(timeout);
+          if (audioChunks.length === 0) return resolve();
+          
+          let totalLen = 0;
+          for (const c of audioChunks) totalLen += c.length;
+          const result = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const c of audioChunks) {
+            result.set(c, offset);
+            offset += c.length;
+          }
+          
+          const blob = new Blob([result], { type: "audio/mp3" });
+          const audio = new Audio(URL.createObjectURL(blob));
+          audio.play().catch(e => console.error("Audio blocked", e));
+          audio.onended = resolve;
+          audio.onerror = resolve;
+        };
+
+        ws.onerror = (e) => {
+          completed = true;
+          clearTimeout(timeout);
+          console.error("TTS Error", e);
+          resolve(); 
+        };
       } catch (e) {
-        console.error(e);
-        resolve();
+        console.error("TTS Exception", e);
+        resolve(); 
       }
     });
   }
@@ -270,7 +334,8 @@
       } else {
         conversationId = data.conversation_id;
         addBubble(data.response, 'ai');
-        await speakBase64Audio(data.audio);
+        // We generate TTS locally to avoid server-side data center IP blocking
+        await speakText(data.response);
       }
     } catch (e) {
       removeTyping();
