@@ -27,21 +27,58 @@
   let typingEl = null;
 
   // ── TTS ──
-  function speakText(text) {
-    if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.05; u.pitch = 1.0;
-    const voices = window.speechSynthesis.getVoices();
-    const v = voices.find(v => v.name.includes('Samantha')) ||
-              voices.find(v => v.lang === 'en-US' && v.name.includes('Female')) ||
-              voices.find(v => v.lang === 'en-US');
-    if (v) u.voice = v;
-    window.speechSynthesis.speak(u);
+  function generateUuid() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
   }
-  if (window.speechSynthesis) {
-    window.speechSynthesis.getVoices();
-    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+
+  async function speakText(text) {
+    if (!text) return;
+    return new Promise((resolve) => {
+      const ws = new WebSocket("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4");
+      ws.binaryType = "arraybuffer";
+      const audioChunks = [];
+
+      ws.onopen = () => {
+        const configMsg = "X-Timestamp:" + new Date().toISOString() + "\\r\\n" +
+                          "Content-Type:application/json; charset=utf-8\\r\\n" +
+                          "Path:speech.config\\r\\n\\r\\n" +
+                          '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}';
+        ws.send(configMsg);
+
+        const requestId = generateUuid();
+        const ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='en-US-AriaNeural'><prosody pitch='+0Hz' rate='+0%'>" + text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</prosody></voice></speak>";
+        const ssmlMsg = "X-RequestId:" + requestId + "\\r\\n" +
+                        "Content-Type:application/ssml+xml\\r\\n" +
+                        "X-Timestamp:" + new Date().toISOString() + "Z\\r\\n" +
+                        "Path:ssml\\r\\n\\r\\n" + ssml;
+        ws.send(ssmlMsg);
+      };
+
+      ws.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          if (event.data.includes("Path:turn.end")) ws.close();
+        } else {
+          const view = new DataView(event.data);
+          const headerSize = view.getUint16(0);
+          audioChunks.push(event.data.slice(headerSize + 2));
+        }
+      };
+
+      ws.onclose = () => {
+        if (audioChunks.length > 0) {
+          const blob = new Blob(audioChunks, { type: "audio/mp3" });
+          const audio = new Audio(URL.createObjectURL(blob));
+          audio.play().catch(console.error);
+          audio.onended = () => resolve();
+        } else {
+          resolve();
+        }
+      };
+      ws.onerror = () => resolve();
+    });
   }
 
   // ── Inject Styles ──
