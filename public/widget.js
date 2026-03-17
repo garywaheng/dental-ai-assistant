@@ -26,6 +26,24 @@
   let greetingSent = false;
   let typingEl = null;
 
+  // ── TTS ──
+  function speakText(text) {
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.05; u.pitch = 1.0;
+    const voices = window.speechSynthesis.getVoices();
+    const v = voices.find(v => v.name.includes('Samantha')) ||
+              voices.find(v => v.lang === 'en-US' && v.name.includes('Female')) ||
+              voices.find(v => v.lang === 'en-US');
+    if (v) u.voice = v;
+    window.speechSynthesis.speak(u);
+  }
+  if (window.speechSynthesis) {
+    window.speechSynthesis.getVoices();
+    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+  }
+
   // ── Inject Styles ──
   const style = document.createElement('style');
   style.textContent = `
@@ -245,6 +263,7 @@
       } else {
         conversationId = data.conversation_id;
         addBubble(data.response, 'ai');
+        speakText(data.response);
       }
     } catch (e) {
       removeTyping();

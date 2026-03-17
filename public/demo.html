@@ -523,10 +523,35 @@ function removeTypingIndicator() {
     if (typingIndicator) { typingIndicator.remove(); typingIndicator = null; }
 }
 
+// ===== TEXT-TO-SPEECH =====
+let ttsEnabled = true;
+function speakText(text) {
+    if (!ttsEnabled || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.05;
+    utterance.pitch = 1.0;
+    // Pick a natural female voice if available
+    const voices = window.speechSynthesis.getVoices();
+    const preferred = voices.find(v => v.name.includes('Samantha')) ||
+                      voices.find(v => v.lang === 'en-US' && v.name.includes('Female')) ||
+                      voices.find(v => v.lang === 'en-US');
+    if (preferred) utterance.voice = preferred;
+    window.speechSynthesis.speak(utterance);
+}
+// Preload voices
+if (window.speechSynthesis) {
+    window.speechSynthesis.getVoices();
+    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+
 // ===== REST API CHAT =====
 async function sendMessage(text) {
     if (!text.trim() || isSending) return;
     isSending = true;
+
+    // Stop any ongoing speech
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
 
     // Don't show user bubble for the initial "hello" greeting
     if (text.trim().toLowerCase() !== 'hello' || chatBox.children.length > 0) {
@@ -553,6 +578,7 @@ async function sendMessage(text) {
         } else {
             conversationId = data.conversation_id;
             addBubble(data.response, 'ai');
+            speakText(data.response);
         }
     } catch (e) {
         removeTypingIndicator();
