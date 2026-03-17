@@ -27,57 +27,28 @@
   let typingEl = null;
 
   // ── TTS ──
-  function generateUuid() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
-  }
-
-  async function speakText(text) {
-    if (!text) return;
+  async function speakBase64Audio(base64Audio) {
+    if (!base64Audio) return;
     return new Promise((resolve) => {
-      const ws = new WebSocket("wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=6A5AA1D4EAFF4E9FB37E23D68491D6F4");
-      ws.binaryType = "arraybuffer";
-      const audioChunks = [];
-
-      ws.onopen = () => {
-        const configMsg = "X-Timestamp:" + new Date().toISOString() + "\\r\\n" +
-                          "Content-Type:application/json; charset=utf-8\\r\\n" +
-                          "Path:speech.config\\r\\n\\r\\n" +
-                          '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}';
-        ws.send(configMsg);
-
-        const requestId = generateUuid();
-        const ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='en-US-AriaNeural'><prosody pitch='+0Hz' rate='+0%'>" + text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</prosody></voice></speak>";
-        const ssmlMsg = "X-RequestId:" + requestId + "\\r\\n" +
-                        "Content-Type:application/ssml+xml\\r\\n" +
-                        "X-Timestamp:" + new Date().toISOString() + "Z\\r\\n" +
-                        "Path:ssml\\r\\n\\r\\n" + ssml;
-        ws.send(ssmlMsg);
-      };
-
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          if (event.data.includes("Path:turn.end")) ws.close();
-        } else {
-          const view = new DataView(event.data);
-          const headerSize = view.getUint16(0);
-          audioChunks.push(event.data.slice(headerSize + 2));
+      try {
+        const binaryString = window.atob(base64Audio);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
         }
-      };
-
-      ws.onclose = () => {
-        if (audioChunks.length > 0) {
-          const blob = new Blob(audioChunks, { type: "audio/mp3" });
-          const audio = new Audio(URL.createObjectURL(blob));
-          audio.play().catch(console.error);
-          audio.onended = () => resolve();
-        } else {
+        const blob = new Blob([bytes], { type: "audio/mp3" });
+        const audio = new Audio(URL.createObjectURL(blob));
+        audio.play().catch(e => {
+          console.error("Audio play blocked", e);
           resolve();
-        }
-      };
-      ws.onerror = () => resolve();
+        });
+        audio.onended = resolve;
+        audio.onerror = resolve;
+      } catch (e) {
+        console.error(e);
+        resolve();
+      }
     });
   }
 
@@ -294,13 +265,12 @@
       });
       const data = await resp.json();
       removeTyping();
-
       if (data.error) {
         addBubble('Sorry, something went wrong. Please try again.', 'ai');
       } else {
         conversationId = data.conversation_id;
         addBubble(data.response, 'ai');
-        speakText(data.response);
+        await speakBase64Audio(data.audio);
       }
     } catch (e) {
       removeTyping();
