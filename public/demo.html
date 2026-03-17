@@ -524,8 +524,27 @@ function removeTypingIndicator() {
 }
 
 // ===== AUDIO PLAYBACK (Azure TTS from server) =====
+let ttsPlaying = false;
+
+function pauseMicForTTS() {
+    if (recognition && micBtn.classList.contains('listening')) {
+        ttsPlaying = true;
+        try { recognition.stop(); } catch(e) {}
+    }
+}
+
+function resumeMicAfterTTS() {
+    if (ttsPlaying && micBtn.classList.contains('listening')) {
+        ttsPlaying = false;
+        try { recognition.start(); } catch(e) {}
+    } else {
+        ttsPlaying = false;
+    }
+}
+
 async function speakBase64Audio(base64Audio) {
     if (!base64Audio) return;
+    pauseMicForTTS();
     return new Promise((resolve) => {
         try {
             const binaryString = window.atob(base64Audio);
@@ -538,12 +557,14 @@ async function speakBase64Audio(base64Audio) {
             const audio = new Audio(URL.createObjectURL(blob));
             audio.play().catch(e => {
                 console.error("Audio play blocked", e);
+                resumeMicAfterTTS();
                 resolve();
             });
-            audio.onended = resolve;
-            audio.onerror = resolve;
+            audio.onended = () => { resumeMicAfterTTS(); resolve(); };
+            audio.onerror = () => { resumeMicAfterTTS(); resolve(); };
         } catch (e) {
             console.error("Audio error:", e);
+            resumeMicAfterTTS();
             resolve();
         }
     });
@@ -656,6 +677,8 @@ if (SpeechRecognition) {
     };
 
     recognition.onend = () => {
+        // Don't auto-restart if TTS is playing (we paused it on purpose)
+        if (ttsPlaying) return;
         if (micBtn.classList.contains("listening")) {
             try { recognition.start(); } catch(e) {}
         } else {
