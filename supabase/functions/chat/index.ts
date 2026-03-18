@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
+import { JWT } from "npm:google-auth-library@9.7.0";
 
 // ═══════════════════════════════════════════════════════════════
 // TYPES
@@ -66,6 +67,8 @@ interface ClinicConfig {
     working_hours: Record<string, string>;
     parking: boolean;
     insurance: string[];
+    assistant_voice?: string;
+    assistant_voice_rate?: string;
   };
   services: ServiceMapping[];
   booking: {
@@ -96,22 +99,66 @@ interface ChatResponse {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TTS LOGIC
+// TTS LOGIC (Azure Cognitive Services Speech)
 // ═══════════════════════════════════════════════════════════════
-function generateUuid() {
-  return crypto.randomUUID().replace(/-/g, "");
-}
 
-async function logToDb(supabase: any, message: string) {
-  console.error(`DB_LOG: ${message}`);
+async function getAzureTTS(
+  text: string,
+  azureKey: string,
+  azureRegion: string,
+  voice = "en-US-AriaNeural",
+  rate = "+0%"
+): Promise<string> {
+  if (!text || !azureKey || !azureRegion) {
+    console.error("TTS: Missing text, key, or region");
+    return "";
+  }
+
+  const escapedText = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+
+  const ssml = `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
+    `<voice name='${voice}'>` +
+    `<prosody rate='${rate}'>${escapedText}</prosody>` +
+    `</voice></speak>`;
+
+  const url = `https://${azureRegion}.tts.speech.microsoft.com/cognitiveservices/v1`;
+
   try {
-    await supabase.from('debug_logs').insert({ message: `[${new Date().toISOString()}] ${message}` });
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Ocp-Apim-Subscription-Key": azureKey,
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "User-Agent": "ClinicAI-TTS",
+      },
+      body: ssml,
+    });
+
+    if (!resp.ok) {
+      console.error(`TTS: Azure returned ${resp.status}: ${await resp.text()}`);
+      return "";
+    }
+
+    const audioBuffer = await resp.arrayBuffer();
+    if (audioBuffer.byteLength === 0) {
+      console.error("TTS: Azure returned empty audio");
+      return "";
+    }
+
+    const b64 = encodeBase64(new Uint8Array(audioBuffer));
+    console.error(`TTS: Generated ${b64.length} chars of base64 audio`);
+    return b64;
   } catch (e) {
-    console.error("Failed to log to DB:", e);
+    console.error("TTS: Azure fetch error:", e);
+    return "";
   }
 }
-
-// Removed getEdgeTTS - handled client-side in widget.js
 
 // ═══════════════════════════════════════════════════════════════
 // TIME & DATE UTILITIES
@@ -250,57 +297,168 @@ function isVagueTime(t: string | null): boolean {
 // DATA LAYER
 // ═══════════════════════════════════════════════════════════════
 
-async function loadDoctors(supabase: any, clinicId: string): Promise<Doctor[]> {
-  const { data } = await supabase.from('doctors').select('*').eq('clinic_id', clinicId);
-  return (data || []).map((d: any) => ({
-    id: String(d.id),
-    name: d.name,
-    specialty: d.specialty.toLowerCase(),
-    schedule: d.schedule || {},
-  }));
-}
-
-async function loadBookings(supabase: any, clinicId: string): Promise<any[]> {
-  const { data } = await supabase.from('bookings').select('*').eq('clinic_id', clinicId);
-  return data || [];
-}
-
-async function saveBooking(supabase: any, clinicId: string, state: BookingState, slotDuration: number) {
-  const { data: existing } = await supabase.from('patients')
-    .select('id')
-    .eq('clinic_id', clinicId)
-    .or(`phone.eq.${state.patient_data.phone},email.eq.${state.patient_data.email}`)
-    .limit(1);
-
-  let patientId: number;
-  if (existing && existing.length > 0) {
-    patientId = existing[0].id;
-  } else {
-    const { data: newPt } = await supabase.from('patients').insert({
-      clinic_id: clinicId,
-      name: state.patient_data.name,
-      phone: state.patient_data.phone,
-      email: state.patient_data.email,
-    }).select('id').single();
-    patientId = newPt?.id;
+async function getSheetsToken(): Promise<string> {
+  const credsStr = Deno.env.get('GOOGLE_SERVICE_ACCOUNT');
+  if (!credsStr) {
+    console.error("Missing GOOGLE_SERVICE_ACCOUNT");
+    throw new Error("Missing Google Service Account config");
   }
-
-  const startT = parseTime12h(state.time!);
-  let endTimeStr = state.time!;
-  if (startT) {
-    const endMin = timeToMinutes(startT) + slotDuration;
-    endTimeStr = formatTime({ hour: Math.floor(endMin / 60), minute: endMin % 60 });
-  }
-
-  await supabase.from('bookings').insert({
-    clinic_id: clinicId,
-    date: state.date,
-    start_time: state.time,
-    end_time: endTimeStr,
-    doctor_id: parseInt(state.doctor_id!),
-    patient_id: patientId,
-    reason: state.reason,
+  const creds = JSON.parse(credsStr);
+  const client = new JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
+  const res = await client.authorize();
+  return res.access_token!;
+}
+
+async function loadDoctors(sheetId: string): Promise<Doctor[]> {
+  try {
+    const token = await getSheetsToken();
+    const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Doctors!A2:J`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!resp.ok) {
+      console.error("Sheets error loading doctors:", await resp.text());
+      return [];
+    }
+    const json = await resp.json();
+    const rows = json.values || [];
+    
+    return rows.map((r: any[]) => {
+      const schedule: Record<string, string> = {};
+      const d = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+      for (let i = 0; i < 7; i++) {
+        if (r[i + 3] && r[i + 3].trim() !== '') {
+          schedule[d[i]] = r[i + 3].trim();
+        }
+      }
+      return {
+        id: String(r[0]),
+        name: r[1],
+        specialty: (r[2] || 'general').toLowerCase(),
+        schedule
+      };
+    });
+  } catch(e) {
+    console.error("Load doctors fail:", e);
+    return [];
+  }
+}
+
+async function loadBookings(sheetId: string): Promise<any[]> {
+  try {
+    const token = await getSheetsToken();
+    const [bResp, pResp] = await Promise.all([
+      fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Bookings!A2:F`, { headers: { Authorization: `Bearer ${token}` } }),
+      fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Patients!A2:D`, { headers: { Authorization: `Bearer ${token}` } })
+    ]);
+    const bJson = await bResp.json();
+    const pJson = await pResp.json();
+    
+    const pRows = pJson.values || [];
+    const patientsMap: Record<string, any> = {};
+    for (const p of pRows) {
+       patientsMap[String(p[0])] = { name: p[1], phone: p[2], email: p[3] };
+    }
+
+    const bRows = bJson.values || [];
+    return bRows.map((r: any[]) => {
+       const pid = String(r[4]);
+       const pData = patientsMap[pid] || {};
+       return {
+         date: r[0],
+         start_time: r[1],
+         end_time: r[2],
+         doctor_id: r[3],
+         patient_id: pid,
+         patient_name: pData.name || '',
+         patient_phone: pData.phone || '',
+         patient_email: pData.email || '',
+         reason: r[5] || ''
+       };
+    });
+  } catch(e) {
+    console.error("Load bookings fail:", e);
+    return [];
+  }
+}
+
+async function saveBooking(sheetId: string, state: BookingState, slotDuration: number) {
+  try {
+    const token = await getSheetsToken();
+    const startT = parseTime12h(state.time!);
+    let endTimeStr = state.time!;
+    if (startT) {
+      const endMin = timeToMinutes(startT) + slotDuration;
+      endTimeStr = formatTime({ hour: Math.floor(endMin / 60), minute: endMin % 60 });
+    }
+
+    // Load Patients to check if patient exists by phone or email
+    const pResp = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Patients!A2:D`, { headers: { Authorization: `Bearer ${token}` } });
+    const pJson = await pResp.json();
+    const pRows = pJson.values || [];
+    
+    let patientId = '';
+    const phone = (state.patient_data.phone || '').replace(/\D/g, '');
+    const email = (state.patient_data.email || '').toLowerCase();
+    
+    for (const p of pRows) {
+        const cPhone = (p[2] || '').replace(/\D/g, '');
+        const cEmail = (p[3] || '').toLowerCase();
+        if ((phone && cPhone === phone) || (email && cEmail === email)) {
+            patientId = p[0];
+            break;
+        }
+    }
+    
+    // Append to Patients if new
+    if (!patientId) {
+        let maxId = 0;
+        for (const p of pRows) {
+            const pid = parseInt(p[0] || '0', 10);
+            if (!isNaN(pid) && pid > maxId) maxId = pid;
+        }
+        patientId = String(maxId + 1);
+        const pValues = [[patientId, state.patient_data.name || '', state.patient_data.phone || '', state.patient_data.email || '']];
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Patients!A:D:append?valueInputOption=USER_ENTERED`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: pValues })
+        });
+    }
+
+    // Fetch current bookings, append new, sort, and overwrite
+    const bResp = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Bookings!A2:F`, { headers: { Authorization: `Bearer ${token}` } });
+    const bJson = await bResp.json();
+    const bRows = bJson.values || [];
+    
+    bRows.push([
+        state.date, 
+        state.time, 
+        endTimeStr, 
+        state.doctor_id, 
+        patientId,
+        state.reason || ''
+    ]);
+
+    bRows.sort((a: any[], b: any[]) => {
+        if (a[0] !== b[0]) return String(a[0]).localeCompare(String(b[0]));
+        const ta = parseTime12h(a[1]);
+        const tb = parseTime12h(b[1]);
+        const ma = ta ? timeToMinutes(ta) : 0;
+        const mb = tb ? timeToMinutes(tb) : 0;
+        return ma - mb;
+    });
+
+    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Bookings!A2:F?valueInputOption=USER_ENTERED`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ values: bRows })
+    });
+  } catch(e) {
+    console.error('Save booking fail:', e);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -369,7 +527,7 @@ function findNearestSlots(
   if (preferredDate) {
     const nd = normalizeDate(preferredDate, now);
     try { anchorDate = new Date(nd + 'T00:00:00'); } catch { anchorDate = now; }
-    if (anchorDate < now) return [];
+    if (fmtDate(anchorDate) < fmtDate(now)) return [];
   } else {
     anchorDate = now;
   }
@@ -388,7 +546,7 @@ function findNearestSlots(
 
   for (let dayOff = 0; dayOff < 15; dayOff++) {
     const checkDate = addDays(anchorDate, dayOff);
-    if (checkDate < now) continue;
+    if (fmtDate(checkDate) < fmtDate(now)) continue;
     const dayName = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][checkDate.getDay()];
     if (!workingHours[dayName]) continue;
 
@@ -520,9 +678,74 @@ async function extractBookingInfo(
   }
 }
 
+const FORBIDDEN_PHRASES = [
+  "hold on", "let me check", "let me see", "wait while", "one moment", 
+  "checking our schedule", "let me look", "pulling up", "i told you", 
+  "as i said", "listen to me", "previously mentioned", "like i said"
+];
+
+function scrubResponse(text: string, doctorNames: string[]): string {
+  let result = text;
+  for (const name of doctorNames) {
+    const regex = new RegExp(name.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'gi');
+    result = result.replace(regex, "our dentist");
+  }
+  for (const phrase of [/(doctor|doc|patient)\s*(id)?\s*\d/gi]) {
+    result = result.replace(phrase, "our dentist");
+  }
+  for (const phrase of FORBIDDEN_PHRASES) {
+    const regex = new RegExp(phrase, 'gi');
+    result = result.replace(regex, "");
+  }
+  return result.replace(/\*[^*]+\*/g, "").trim();
+}
+
+function validateResponse(text: string, step: number): { valid: boolean; issues: string[] } {
+  const issues: string[] = [];
+  if (!text || text.trim().length < 5) issues.push("Empty or too short");
+  if (/\*[^*]+\*/.test(text)) issues.push("Contains asterisk action");
+  if ([1,2,3,4].includes(step) && !text.includes("?")) issues.push("No question mark");
+  for (const phrase of FORBIDDEN_PHRASES) {
+    if (text.toLowerCase().includes(phrase)) issues.push(`Contains forbidden phrase: ${phrase}`);
+  }
+  if (step !== 5) {
+    const sentenceCount = (text.match(/[.!?]+/g) || []).length;
+    if (sentenceCount > 3) issues.push("Too verbose");
+  }
+  return { valid: issues.length === 0, issues };
+}
+
+function fallbackExtractDateTime(text: string): { date: string | null; time: string | null } {
+  const tl = text.toLowerCase().trim();
+  let date: string | null = null;
+  let time: string | null = null;
+  if (tl.includes('tomorrow') || tl.includes('tmrw')) date = 'tomorrow';
+  else if (tl.includes('today')) date = 'today';
+  else if (tl.includes('day after tomorrow')) date = 'day after tomorrow';
+  else {
+    const days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+    for (const d of days) {
+      if (tl.includes(d)) { date = (tl.includes('next') ? 'next ' : '') + d; break; }
+    }
+  }
+  if (/mornin/.test(tl)) time = 'morning';
+  else if (/afternoo/.test(tl)) time = 'afternoon';
+  else if (/evenin/.test(tl)) time = 'evening';
+  else {
+    const tm = tl.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+    if (tm) time = `${tm[1]}:${tm[2] || '00'} ${tm[3].toUpperCase()}`;
+    else {
+      const am = tl.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\b/);
+      if (am) time = `${parseInt(am[1])}:${am[2] || '00'} ${parseInt(am[1]) >= 1 && parseInt(am[1]) <= 7 ? 'PM' : 'AM'}`;
+    }
+  }
+  return { date, time };
+}
+
 async function generateResponse(
-  cfg: ClinicConfig, apiKey: string, chatHistory: any[], state: BookingState, now: Date
+  cfg: ClinicConfig, apiKey: string, chatHistory: any[], state: BookingState, now: Date, doctors: Doctor[], bookings: any[]
 ): Promise<string> {
+  const doctorNames = doctors.map(d => d.name);
   const rd = getReadableDate(state.date);
   const currentDate = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const currentTime = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
@@ -540,7 +763,32 @@ async function generateResponse(
   } else if (state.step === 1) {
     instruction = `Welcome patient to ${c.name}. Ask what ${c.specialty_label} issue they need help with (e.g., ${svcExamples}). End with ?`;
   } else if (state.step === 2) {
-    instruction = `Patient needs: '${state.reason}'. Suggest available times or ask for preferred date/time. End with ?`;
+    let hint = '';
+    let slots: SlotInfo[] = [];
+    const wh = c.working_hours;
+    const dur = cfg.booking.slot_duration_minutes;
+    
+    if (!state.date && !state.time) {
+      slots = findNearestSlots(state.reason || '', doctors, cfg.services, bookings, wh, dur, now);
+    } else if (state.date && !state.time) {
+      slots = findNearestSlots(state.reason || '', doctors, cfg.services, bookings, wh, dur, now, state.date);
+    } else if (state.date && isVagueTime(state.time)) {
+      const ranges = { morning: [{ hour: 8, minute: 0 }, { hour: 12, minute: 0 }], afternoon: [{ hour: 12, minute: 0 }, { hour: 17, minute: 0 }], evening: [{ hour: 17, minute: 0 }, { hour: 20, minute: 0 }] };
+      const [vStart, vEnd] = (ranges as any)[(state.time||'').toLowerCase()] || [null, null];
+      slots = findNearestSlots(state.reason || '', doctors, cfg.services, bookings, wh, dur, now, state.date, null, 3, vStart, vEnd);
+    } else {
+      slots = state.suggested_slots || [];
+    }
+
+    state.suggested_slots = slots;
+
+    if (slots && slots.length > 0) {
+      hint = `\nHINT: Suggest EXACTLY these available times: ${formatSlots(slots)}. NEVER invent any other times! Offer these choices to the patient!`;
+    } else if (state.date) {
+      hint = `\nHINT: We have NO availability near ${getReadableDate(state.date)}. Tell them we don't have availability on that date and ask if they'd like to try another day.`;
+    }
+    
+    instruction = `Patient needs: '${state.reason}'. ${state.date ? 'They prefer ' + getReadableDate(state.date) + '.' : ''} You MUST follow the HINT below. If no HINT, ask what date and time work best. End with ?${hint}`;
   } else if (state.step === 3) {
     instruction = `Tell patient EXACTLY: "${state.availability_error}". End with ?`;
   } else if (state.step === 4) {
@@ -549,20 +797,37 @@ async function generateResponse(
     instruction = `BOOKING CONFIRMED. Say: "Your appointment is confirmed for ${rd} at ${state.time} for ${state.reason}. Thank you for choosing ${c.name}!" No questions.`;
   }
 
-  const sysPrompt = `You are ${c.assistant_name}, receptionist at ${c.name}. Phone call.\nToday: ${currentDate}. Time: ${currentTime}.\nParking: ${parking}. Insurance: ${insurance}. Address: ${c.address}.\nRules: Be concise (1-2 sentences). Never mention doctor names/IDs. Never say "hold on" or "let me check". Never use asterisks.\n${instruction}`;
+  const sysPrompt = `You are ${c.assistant_name}, receptionist at ${c.name}. Phone call.\nToday: ${currentDate}. Time: ${currentTime}.\nParking: ${parking}. Insurance: ${insurance}. Address: ${c.address}.\nRules: Be concise (1-2 sentences). Never mention doctor names/IDs. Never say "hold on" or "let me check". Never use asterisks.\n\nCURRENT INSTRUCTION: ${instruction}`;
 
   const msgs = [{ role: 'system', content: sysPrompt }, ...chatHistory.filter((m: any) => m.role !== 'system')];
 
-  try {
-    const raw = await callLLM(cfg.llm.base_url, cfg.llm.model, apiKey, msgs, cfg.llm.max_tokens_respond, cfg.llm.temperature_respond);
-    return raw;
-  } catch (e) {
-    console.error('Response gen error:', e);
-    if (state.step === 1) return `Welcome to ${c.name}! What ${c.specialty_label} concern can I help with?`;
-    if (state.step === 4) return `${rd} at ${state.time} is available! Could I get your ${fieldStr}?`;
-    if (state.step === 5) return `Your appointment is confirmed for ${rd} at ${state.time} for ${state.reason}. Thank you for choosing ${c.name}!`;
-    return `I'm here to help you book a ${c.specialty_label} appointment. What can I assist with?`;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const raw = await callLLM(cfg.llm.base_url, cfg.llm.model, apiKey, msgs, cfg.llm.max_tokens_respond, cfg.llm.temperature_respond);
+      let cleaned = scrubResponse(raw, doctorNames);
+      const { valid, issues } = validateResponse(cleaned, state.step);
+      
+      if (valid) return cleaned;
+      
+      console.warn(`[Gen Attempt ${attempt+1}] Invalid: ${issues.join(', ')} | Raw: ${cleaned}`);
+      if (issues.some(i => i.includes("question mark")) && [1,2,3,4].includes(state.step)) {
+        if (state.step === 1) cleaned = cleaned.replace(/[.!]+$/, '') + ` — what ${c.specialty_label} issue can I help with?`;
+        else if (state.step === 2) cleaned = cleaned.replace(/[.!]+$/, '') + " — what date and time work best for you?";
+        else if (state.step === 3) cleaned = cleaned.replace(/[.!]+$/, '') + " — would that alternative time work for you?";
+        else if (state.step === 4) cleaned = cleaned.replace(/[.!]+$/, '') + ` — could I get your ${fieldStr}?`;
+        if (validateResponse(cleaned, state.step).valid) return cleaned;
+      }
+    } catch (e) {
+      console.error(`[Gen Attempt ${attempt+1}] Error:`, e);
+    }
   }
+
+  // Fallbacks
+  if (state.is_modification) return `I can only book new appointments. Call us at ${c.phone} for changes. Would you like to book a new appointment instead?`;
+  if (state.step === 3) return `I'm sorry, that time isn't available. ${state.availability_error}`;
+  if (state.step === 4) return `Great, ${rd} at ${state.time} is available! Could I get your ${fieldStr} to finalize?`;
+  if (state.step === 5) return `Your appointment is confirmed for ${rd} at ${state.time} for ${state.reason}. Thank you for choosing ${c.name}!`;
+  return `I'm here to help book your ${c.specialty_label} appointment. What can I assist with?`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -590,6 +855,19 @@ async function processMessage(
   const slotDur = cfg.booking.slot_duration_minutes;
 
   const partial = await extractBookingInfo(cfg, apiKey, chatHistory, text, state, now);
+  
+  const fb = fallbackExtractDateTime(text);
+  if (fb.date) {
+    if (!partial.date || fb.date !== normalizeDate(partial.date, now)) {
+      console.log(`[FALLBACK] Date override: ${partial.date} -> ${fb.date}`);
+      partial.date = fb.date;
+    }
+  }
+  if (fb.time && !partial.time) {
+    console.log(`[FALLBACK] Time extraction: ${fb.time}`);
+    partial.time = fb.time;
+  }
+
   const oldStep = state.step;
 
   if (partial.reason && isValidReason(partial.reason, services)) state.reason = partial.reason;
@@ -612,22 +890,36 @@ async function processMessage(
 
       if (state.step === 1 && state.reason && isValidReason(state.reason, services)) {
         state.step = 2; state.retries = 0;
-      } else if (state.step === 2 && state.date && state.time && !isVagueTime(state.time)) {
-        const slots = findNearestSlots(state.reason || '', doctors, services, bookings, wh, slotDur, now, state.date, state.time, 3);
-        state.suggested_slots = slots;
-        if (!slots.length) {
-          state.availability_error = `No availability near ${getReadableDate(state.date)}. Could you suggest another day?`;
-          state.step = 3; state.retries = 0;
-        } else {
-          const reqT = parseTime12h(state.time!);
-          const firstT = parseTime12h(slots[0].time);
-          const match = slots[0].date === normalizeDate(state.date!, now) && reqT && firstT && timeToMinutes(reqT) === timeToMinutes(firstT);
-          if (match) {
-            state.doctor_id = slots[0].doctor_id;
-            state.step = 4; state.retries = 0;
-          } else {
-            state.availability_error = `That slot isn't available. Nearest options: ${formatSlots(slots)}. Which works?`;
+        state.suggested_slots = findNearestSlots(state.reason, doctors, services, bookings, wh, slotDur, now);
+      } else if (state.step === 2 && state.date && state.time) {
+        if (isVagueTime(state.time)) {
+          const ranges = { morning: [{ hour: 8, minute: 0 }, { hour: 12, minute: 0 }], afternoon: [{ hour: 12, minute: 0 }, { hour: 17, minute: 0 }], evening: [{ hour: 17, minute: 0 }, { hour: 20, minute: 0 }] };
+          const [vStart, vEnd] = (ranges as any)[state.time.toLowerCase()] || [null, null];
+          const slots = findNearestSlots(state.reason || '', doctors, services, bookings, wh, slotDur, now, state.date, state.time, 3, vStart, vEnd);
+          state.suggested_slots = slots;
+          if (!slots.length) {
+            state.availability_error = `No availability for ${state.time} on ${getReadableDate(state.date)}. Could you suggest another day?`;
             state.step = 3; state.retries = 0;
+          } else {
+            // Stay at step 2, but provide hints
+            break;
+          }
+        } else {
+          const slots = findNearestSlots(state.reason || '', doctors, services, bookings, wh, slotDur, now, state.date, state.time, 3);
+          state.suggested_slots = slots;
+          if (!slots.length) {
+            state.availability_error = `No availability near ${getReadableDate(state.date)}. Could you suggest another day?`;
+            state.step = 3; state.retries = 0;
+          } else {
+            const reqT = parseTime12h(state.time!);
+            const matchSlot = slots.find(s => s.date === normalizeDate(state.date!, now) && reqT && timeToMinutes(parseTime12h(s.time)!) === timeToMinutes(reqT));
+            if (matchSlot) {
+              state.doctor_id = matchSlot.doctor_id;
+              state.step = 4; state.retries = 0;
+            } else {
+              state.availability_error = `That slot isn't available. Nearest options: ${formatSlots(slots)}. Which works?`;
+              state.step = 3; state.retries = 0;
+            }
           }
         }
       } else if (state.step === 3) {
@@ -676,7 +968,7 @@ async function processMessage(
   } else if (state.step === 5) {
     response = `Your appointment is confirmed for ${rd} at ${state.time} for ${state.reason}. Thank you for choosing ${c.name}!`;
   } else {
-    response = await generateResponse(cfg, apiKey, chatHistory, state, now);
+    response = await generateResponse(cfg, apiKey, chatHistory, state, now, doctors, bookings);
   }
 
   chatHistory.push({ role: 'assistant', content: response });
@@ -716,11 +1008,15 @@ Deno.serve(async (req: Request) => {
     const llmApiKey = Deno.env.get('LLM_API_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const { data: cfgRow } = await supabase.from('clinic_config').select('config').eq('id', clinic_id).single();
+    const { data: cfgRow } = await supabase.from('clinic_config').select('config, sheet_id').eq('id', clinic_id).single();
     if (!cfgRow) {
       return new Response(JSON.stringify({ error: 'Clinic not found' }), { status: 404, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
     const cfg: ClinicConfig = cfgRow.config;
+    const sheet_id = cfgRow.sheet_id;
+    if (!sheet_id) {
+      return new Response(JSON.stringify({ error: 'Clinic setup incomplete: no Google Sheet assigned' }), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+    }
     const now = getCurrentTime(cfg.clinic.timezone);
 
     let state: BookingState;
@@ -741,14 +1037,14 @@ Deno.serve(async (req: Request) => {
       chatHistory = [];
     }
 
-    const doctors = await loadDoctors(supabase, clinic_id);
-    const bookings = await loadBookings(supabase, clinic_id);
+    const doctors = await loadDoctors(sheet_id);
+    const bookings = await loadBookings(sheet_id);
 
     const response = await processMessage(message, state, chatHistory, cfg, llmApiKey, doctors, bookings, now);
 
     if (state.step === 5 && state.saved) {
       try {
-        await saveBooking(supabase, clinic_id, state, cfg.booking.slot_duration_minutes);
+        await saveBooking(sheet_id, state, cfg.booking.slot_duration_minutes);
       } catch (e) {
         console.error('Save booking error:', e);
       }
@@ -763,11 +1059,21 @@ Deno.serve(async (req: Request) => {
       conversation_id = newConv?.id;
     }
 
-    // TTS now handled client-side in widget.js to avoid IP blocks
+    // Generate TTS via Azure Speech
+    let audioBase64 = "";
+    const azureKey = Deno.env.get('AZURE_SPEECH_KEY') || "";
+    const azureRegion = Deno.env.get('AZURE_SPEECH_REGION') || "eastus";
+    if (azureKey) {
+      const voiceName = cfg.clinic.assistant_voice || "en-US-AriaNeural";
+      const voiceRate = cfg.clinic.assistant_voice_rate || "+0%";
+      audioBase64 = await getAzureTTS(response, azureKey, azureRegion, voiceName, voiceRate);
+    }
+
     return new Response(JSON.stringify({
       response,
       conversation_id,
       step: state.step,
+      audio: audioBase64,
     }), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
     });

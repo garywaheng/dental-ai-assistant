@@ -3,8 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
     <title>Bright Smiles Dental Clinic</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
     <style>
         *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
         html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; }
@@ -458,11 +460,16 @@
 </div>
 
 <script>
-// ===== CHAT TOGGLE =====
+// ===== CONFIG =====
+const CHAT_API = 'https://mczhyqnehkmzyijsktcf.supabase.co/functions/v1/chat';
+const CLINIC_ID = 'default';
+
 let chatOpened = false;
 let greetingSent = false;
-let wsReady = false;
+let conversationId = null;
+let isSending = false;
 
+// ===== CHAT TOGGLE =====
 function toggleChat() {
     const widget = document.getElementById('dental-widget-container');
     const btn = document.getElementById('book-btn');
@@ -480,23 +487,18 @@ function toggleChat() {
 }
 
 function triggerGreeting() {
-    if (greetingSent || !chatOpened || !wsReady) return;
+    if (greetingSent || !chatOpened) return;
     greetingSent = true;
-    showTypingIndicator();
-    ws.send(JSON.stringify({ type: "user_input", text: "hello" }));
+    sendMessage('hello');
 }
 
-// ===== WEBSOCKET =====
+// ===== DOM HELPERS =====
 const chatBox = document.getElementById("dental-widget-chat");
 const inputField = document.getElementById("chat-input");
-const sendBtn = document.getElementById("send-btn");
+const sendBtnEl = document.getElementById("send-btn");
 const micBtn = document.getElementById("mic-btn");
-const statusEl = document.getElementById("connection-status");
 
-let ws = null, currentAiBubble = null, typingIndicator = null;
-let audioQueue = [], isPlaying = false, currentAudio = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT = 10;
+let typingIndicator = null;
 
 function scrollToBottom() { chatBox.scrollTop = chatBox.scrollHeight; }
 
@@ -523,69 +525,113 @@ function removeTypingIndicator() {
     if (typingIndicator) { typingIndicator.remove(); typingIndicator = null; }
 }
 
-function connectWebSocket() {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(protocol + "//" + window.location.host + "/ws");
+// ===== AUDIO PLAYBACK (Azure TTS from server) =====
+let ttsPlaying = false;
 
-    ws.onopen = () => {
-        wsReady = true;
-        reconnectAttempts = 0;
-        triggerGreeting();
-    };
-    ws.onclose = () => {
-        wsReady = false;
-        if (reconnectAttempts < MAX_RECONNECT) {
-            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
-            reconnectAttempts++;
-            setTimeout(connectWebSocket, delay);
-        }
-    };
-    ws.onerror = (err) => console.error("WebSocket error:", err);
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.type === "text_delta") {
-            removeTypingIndicator();
-            if (!currentAiBubble) currentAiBubble = addBubble("", "ai");
-            currentAiBubble.textContent += data.content; 
-            scrollToBottom();
-        } else if (data.type === "audio") {
-            audioQueue.push("data:audio/mp3;base64," + data.data);
-            playNextAudio();
-        } else if (data.type === "generation_done") {
-            removeTypingIndicator(); currentAiBubble = null;
-        }
-    };
+function pauseMicForTTS() {
+    if (recognition && micBtn.classList.contains('listening')) {
+        ttsPlaying = true;
+        try { recognition.stop(); } catch(e) {}
+    }
 }
-connectWebSocket();
 
-function sendMessage(text) {
-    if (!text.trim() || !ws || ws.readyState !== WebSocket.OPEN) return;
-    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-    audioQueue = []; isPlaying = false;
-    try { ws.send(JSON.stringify({ type: "interrupt" })); } catch (e) {}
-    removeTypingIndicator();
-    addBubble(text, "user");
-    ws.send(JSON.stringify({ type: "user_input", text }));
+function resumeMicAfterTTS() {
+    if (ttsPlaying && micBtn.classList.contains('listening')) {
+        ttsPlaying = false;
+        try { recognition.start(); } catch(e) {}
+    } else {
+        ttsPlaying = false;
+    }
+}
+
+async function speakBase64Audio(base64Audio) {
+    if (!base64Audio) return;
+    pauseMicForTTS();
+    return new Promise((resolve) => {
+        try {
+            const binaryString = window.atob(base64Audio);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            const blob = new Blob([bytes], { type: "audio/mp3" });
+            const audio = new Audio(URL.createObjectURL(blob));
+            audio.play().catch(e => {
+                console.error("Audio play blocked", e);
+                resumeMicAfterTTS();
+                resolve();
+            });
+            audio.onended = () => { resumeMicAfterTTS(); resolve(); };
+            audio.onerror = () => { resumeMicAfterTTS(); resolve(); };
+        } catch (e) {
+            console.error("Audio error:", e);
+            resumeMicAfterTTS();
+            resolve();
+        }
+    });
+}
+
+// ===== REST API CHAT =====
+async function sendMessage(text) {
+    if (!text.trim() || isSending) return;
+    isSending = true;
+
+    // Stop any ongoing speech
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+
+    // Don't show user bubble for the initial "hello" greeting
+    if (text.trim().toLowerCase() !== 'hello' || chatBox.children.length > 0) {
+        addBubble(text, "user");
+    }
     showTypingIndicator();
+
+    try {
+        const resp = await fetch(CHAT_API, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                message: text,
+                conversation_id: conversationId,
+                clinic_id: CLINIC_ID,
+            }),
+        });
+
+        const data = await resp.json();
+        removeTypingIndicator();
+
+        if (data.error) {
+            addBubble('Sorry, something went wrong. Please try again.', 'ai');
+            isSending = false;
+        } else {
+            conversationId = data.conversation_id;
+            addBubble(data.response, 'ai');
+            isSending = false; // Allow user to type immediately while audio plays
+            await speakBase64Audio(data.audio);
+        }
+    } catch (e) {
+        removeTypingIndicator();
+        addBubble('Connection error. Please try again.', 'ai');
+        console.error('Chat API error:', e);
+        isSending = false;
+    }
 }
 
-inputField.addEventListener("keypress", (e) => { if (e.key === "Enter") { sendMessage(inputField.value); inputField.value = ""; } });
-sendBtn.addEventListener("click", () => { sendMessage(inputField.value); inputField.value = ""; });
+inputField.addEventListener("keypress", (e) => { if (e.key === "Enter") { const v = inputField.value; inputField.value = ""; sendMessage(v); } });
+sendBtnEl.addEventListener("click", () => { const v = inputField.value; inputField.value = ""; sendMessage(v); });
 
 // ===== MICROPHONE =====
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
-let isMutedByVoice = false;
 
 if (SpeechRecognition) {
     recognition = new SpeechRecognition();
-    recognition.continuous = true; 
-    recognition.interimResults = true; 
+    recognition.continuous = true;
+    recognition.interimResults = true;
     recognition.lang = 'en-US';
 
     micBtn.addEventListener("click", () => {
         if (micBtn.classList.contains("listening")) {
-            isMutedByVoice = false;
             micBtn.classList.remove("listening");
             recognition.stop();
         } else {
@@ -594,19 +640,10 @@ if (SpeechRecognition) {
         }
     });
 
-    recognition.onstart = () => {
-        if (!isMutedByVoice) {
-            micBtn.classList.add("listening");
-            if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-            audioQueue = []; isPlaying = false;
-            try { ws.send(JSON.stringify({ type: "interrupt" })); } catch (e) {}
-        }
-    };
+    recognition.onstart = () => { micBtn.classList.add("listening"); };
 
-    // Accumulate speech and wait 2s of total silence before sending
     let speechBuffer = '';
     let speechTimer = null;
-    const SPEECH_SEND_DELAY = 2000;
 
     function resetSpeechTimer() {
         if (speechTimer) clearTimeout(speechTimer);
@@ -618,11 +655,10 @@ if (SpeechRecognition) {
             }
             speechBuffer = '';
             speechTimer = null;
-        }, SPEECH_SEND_DELAY);
+        }, 2000);
     }
 
     recognition.onresult = (event) => {
-        if (isMutedByVoice) return;
         let finalT = '', interimT = '';
         for (let i = event.resultIndex; i < event.results.length; ++i) {
             if (event.results[i].isFinal) finalT += event.results[i][0].transcript;
@@ -634,56 +670,25 @@ if (SpeechRecognition) {
         } else if (interimT) {
             inputField.value = speechBuffer + (speechBuffer ? ' ' : '') + interimT;
         }
-        // Reset timer on ANY speech activity (final or interim) — user is still talking
         resetSpeechTimer();
     };
 
     recognition.onerror = (event) => {
         if (event.error !== 'no-speech' && event.error !== 'aborted') {
             micBtn.classList.remove("listening");
-            console.error("Mic Error:", event.error);
         }
     };
 
-    recognition.onend = () => { 
-        if (!isMutedByVoice && micBtn.classList.contains("listening")) {
+    recognition.onend = () => {
+        // Don't auto-restart if TTS is playing (we paused it on purpose)
+        if (ttsPlaying) return;
+        if (micBtn.classList.contains("listening")) {
             try { recognition.start(); } catch(e) {}
-        } else if (!isMutedByVoice) {
-            micBtn.classList.remove("listening");
-            inputField.value = ''; 
+        } else {
+            inputField.value = '';
         }
     };
 } else { micBtn.style.display = "none"; }
-
-// ===== AUDIO =====
-function playNextAudio() {
-    if (isPlaying || audioQueue.length === 0) return;
-    isPlaying = true;
-
-    if (recognition && micBtn.classList.contains("listening")) {
-        isMutedByVoice = true;
-        recognition.stop();
-    }
-
-    const src = audioQueue.shift();
-    currentAudio = new Audio(src);
-
-    const finishAudio = () => {
-        isPlaying = false; 
-        currentAudio = null; 
-        if (isMutedByVoice) {
-            isMutedByVoice = false;
-            if (micBtn.classList.contains("listening")) {
-                try { recognition.start(); } catch (e) {}
-            }
-        }
-        playNextAudio();
-    };
-
-    currentAudio.play().catch(finishAudio);
-    currentAudio.onended = finishAudio;
-    currentAudio.onerror = finishAudio;
-}
 </script>
 
 </body>

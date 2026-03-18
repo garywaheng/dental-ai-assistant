@@ -1,0 +1,8 @@
+{
+  "name": "dental-ai-assistant",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npx -y serve public",
+    "deploy:func": "npx -y supabase functions deploy chat --no-verify-jwt"
+  }
+}
