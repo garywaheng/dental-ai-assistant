@@ -527,6 +527,7 @@ function removeTypingIndicator() {
 
 // ===== AUDIO PLAYBACK (Azure TTS from server) =====
 let ttsPlaying = false;
+let currentTtsAudio = null;
 
 function pauseMicForTTS() {
     if (recognition && micBtn.classList.contains('listening')) {
@@ -556,14 +557,30 @@ async function speakBase64Audio(base64Audio) {
                 bytes[i] = binaryString.charCodeAt(i);
             }
             const blob = new Blob([bytes], { type: "audio/mp3" });
+            
+            if (currentTtsAudio) {
+                currentTtsAudio.pause();
+                currentTtsAudio = null;
+            }
+
             const audio = new Audio(URL.createObjectURL(blob));
+            currentTtsAudio = audio;
+
             audio.play().catch(e => {
                 console.error("Audio play blocked", e);
                 resumeMicAfterTTS();
                 resolve();
             });
-            audio.onended = () => { resumeMicAfterTTS(); resolve(); };
-            audio.onerror = () => { resumeMicAfterTTS(); resolve(); };
+            audio.onended = () => { 
+                if (currentTtsAudio === audio) currentTtsAudio = null;
+                resumeMicAfterTTS(); 
+                resolve(); 
+            };
+            audio.onerror = () => { 
+                if (currentTtsAudio === audio) currentTtsAudio = null;
+                resumeMicAfterTTS(); 
+                resolve(); 
+            };
         } catch (e) {
             console.error("Audio error:", e);
             resumeMicAfterTTS();
@@ -579,6 +596,10 @@ async function sendMessage(text) {
 
     // Stop any ongoing speech
     if (window.speechSynthesis) window.speechSynthesis.cancel();
+    if (currentTtsAudio) {
+        currentTtsAudio.pause();
+        currentTtsAudio = null;
+    }
 
     // Don't show user bubble for the initial "hello" greeting
     if (text.trim().toLowerCase() !== 'hello' || chatBox.children.length > 0) {

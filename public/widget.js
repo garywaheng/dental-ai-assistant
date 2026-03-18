@@ -25,6 +25,7 @@
   let chatOpened = false;
   let greetingSent = false;
   let typingEl = null;
+  let currentAudio = null;
 
   // ── TTS (Azure TTS from server) ──
   async function speakBase64Audio(base64Audio) {
@@ -38,13 +39,27 @@
           bytes[i] = binaryString.charCodeAt(i);
         }
         const blob = new Blob([bytes], { type: "audio/mp3" });
+        
+        if (currentAudio) {
+          currentAudio.pause();
+          currentAudio = null;
+        }
+
         const audio = new Audio(URL.createObjectURL(blob));
+        currentAudio = audio;
+
         audio.play().catch(e => {
           console.error("Audio play blocked", e);
           resolve();
         });
-        audio.onended = resolve;
-        audio.onerror = resolve;
+        audio.onended = () => {
+          if (currentAudio === audio) currentAudio = null;
+          resolve();
+        };
+        audio.onerror = () => {
+          if (currentAudio === audio) currentAudio = null;
+          resolve();
+        };
       } catch (e) {
         console.error("Audio error:", e);
         resolve();
@@ -246,6 +261,11 @@
   async function sendMessage(text) {
     if (!text.trim() || isSending) return;
     isSending = true;
+
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio = null;
+    }
 
     // Don't show user bubble for initial greeting
     if (text.trim().toLowerCase() !== 'hello' || chatBox.children.length > 0) {

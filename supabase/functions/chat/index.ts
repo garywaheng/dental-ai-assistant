@@ -313,9 +313,8 @@ async function getSheetsToken(): Promise<string> {
   return res.access_token!;
 }
 
-async function loadDoctors(sheetId: string): Promise<Doctor[]> {
+async function loadDoctors(sheetId: string, token: string): Promise<Doctor[]> {
   try {
-    const token = await getSheetsToken();
     const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Doctors!A2:J`;
     const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!resp.ok) {
@@ -346,9 +345,8 @@ async function loadDoctors(sheetId: string): Promise<Doctor[]> {
   }
 }
 
-async function loadBookings(sheetId: string): Promise<any[]> {
+async function loadBookings(sheetId: string, token: string): Promise<any[]> {
   try {
-    const token = await getSheetsToken();
     const [bResp, pResp] = await Promise.all([
       fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Bookings!A2:F`, { headers: { Authorization: `Bearer ${token}` } }),
       fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Patients!A2:D`, { headers: { Authorization: `Bearer ${token}` } })
@@ -1008,7 +1006,13 @@ Deno.serve(async (req: Request) => {
     const llmApiKey = Deno.env.get('LLM_API_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    const { data: cfgRow } = await supabase.from('clinic_config').select('config, sheet_id').eq('id', clinic_id).single();
+    // Parallelize Supabase config and conversation loading
+    const [cfgRes, convRes] = await Promise.all([
+      supabase.from('clinic_config').select('config, sheet_id').eq('id', clinic_id).single(),
+      conversation_id ? supabase.from('conversations').select('*').eq('id', conversation_id).single() : Promise.resolve({ data: null })
+    ]);
+
+    const { data: cfgRow } = cfgRes;
     if (!cfgRow) {
       return new Response(JSON.stringify({ error: 'Clinic not found' }), { status: 404, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
@@ -1022,23 +1026,21 @@ Deno.serve(async (req: Request) => {
     let state: BookingState;
     let chatHistory: any[];
 
-    if (conversation_id) {
-      const { data: conv } = await supabase.from('conversations').select('*').eq('id', conversation_id).single();
-      if (conv) {
-        state = conv.state;
-        chatHistory = conv.chat_history;
-      } else {
-        state = createInitialState(cfg);
-        chatHistory = [];
-        conversation_id = undefined;
-      }
+    if (convRes.data) {
+      state = convRes.data.state;
+      chatHistory = convRes.data.chat_history;
     } else {
       state = createInitialState(cfg);
       chatHistory = [];
+      conversation_id = undefined;
     }
 
-    const doctors = await loadDoctors(sheet_id);
-    const bookings = await loadBookings(sheet_id);
+    // Parallelize Google Sheets data loading
+    const sheetsToken = await getSheetsToken();
+    const [doctors, bookings] = await Promise.all([
+      loadDoctors(sheet_id, sheetsToken),
+      loadBookings(sheet_id, sheetsToken)
+    ]);
 
     const response = await processMessage(message, state, chatHistory, cfg, llmApiKey, doctors, bookings, now);
 
